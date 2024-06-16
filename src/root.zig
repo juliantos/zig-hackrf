@@ -197,6 +197,9 @@ pub fn GetDevices(Context: ?*anyopaque, Devices: *std.ArrayList(DEVICE_DATA)) vo
             deviceData.Handle = win.kernel32.CreateFileW(sentinel, win.GENERIC_READ | win.GENERIC_WRITE, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL | win.FILE_FLAG_OVERLAPPED, null);
             deviceData.DevicePath.appendSlice(sentinel) catch {};
 
+            defer allocator.destroy(@as(*setup.SP_DEVICE_INTERFACE_DETAIL_DATA_W, @ptrCast(detailData)));
+            //detailData = null; // previous cast nullifies
+
             if (deviceData.Handle == win.INVALID_HANDLE_VALUE)
                 continue;
 
@@ -254,11 +257,13 @@ pub fn HandleEventsTimeout(Context: ?*anyopaque, Timeout: u64, Completed: ?*bool
 
                 if (activeTransfer.TransferPtr.Callback != null)
                     activeTransfer.TransferPtr.Callback.?(activeTransfer.TransferPtr);
+                defer std.heap.page_allocator.destroy(activeTransfer.Overlapped);
             },
             usb.WAIT_ABANDONED_0...(usb.WAIT_ABANDONED_0 + usb.MAXIMUM_WAIT_OBJECTS) => {
                 const index = val - usb.WAIT_ABANDONED_0;
                 TransferMutex.lock();
-                _ = ActiveTransfers.swapRemove(index);
+                const activeTransfer = ActiveTransfers.swapRemove(index);
+                defer std.heap.page_allocator.destroy(activeTransfer.Overlapped);
                 TransferMutex.unlock();
             },
             usb.WAIT_TIMEOUT => {
@@ -345,6 +350,7 @@ pub fn CloseDevice(DeviceData: PDEVICE_DATA) void {
     DeviceData.HandlesOpen = false;
     DeviceData.WinusbHandle = null;
     DeviceData.Handle = null;
+    DeviceData.DevicePath.deinit();
     DeviceData.InPipes.deinit();
     DeviceData.OutPipes.deinit();
 
@@ -363,7 +369,7 @@ pub fn ControlTransfer(DeviceData: PDEVICE_DATA, RequestType: u8, Request: u8, V
     };
     var lengthTransferred: win.ULONG = undefined;
 
-    std.debug.print("RT 0x{b:0>8}, R 0x{x:0>2}, V {d:>5}, I {d:>5}, D {x:0>2}, L {d:>5}\n", .{ RequestType, Request, Value, Index, Data.*, Length });
+    //std.debug.print("RT 0x{b:0>8}, R 0x{x:0>2}, V {d:>5}, I {d:>5}, D {x:0>2}, L {d:>5}\n", .{ RequestType, Request, Value, Index, Data.*, Length });
 
     bResult = usb.WinUsb_ControlTransfer(DeviceData.WinusbHandle, setupPacket, Data, Length, &lengthTransferred, null);
     if (bResult != win.TRUE) {
@@ -486,6 +492,8 @@ pub fn FreeTransfer(TransferPtr: ?*Transfer) bool {
     if (TransferPtr != null) {
         TransferPtr.?.Callback = null;
         TransferPtr.?.UserData = null;
+
+        defer std.heap.page_allocator.destroy(TransferPtr.?);
     }
 
     return true;

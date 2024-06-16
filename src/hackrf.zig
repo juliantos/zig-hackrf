@@ -230,10 +230,10 @@ pub fn hackrf_close(Device: *HackrfDevice) HACKRF_STATUS {
 
     _ = free_transfers(Device);
 
-    // FIXME kill concurrency
-
     _ = driver.ReleaseInterface(Device.UsbDevice, 0);
     driver.CloseDevice(Device.UsbDevice);
+
+    defer std.heap.page_allocator.destroy(Device);
 
     DeviceCount -= 1;
     if (result_thread != HACKRF_STATUS.HACKRF_SUCCESS) {
@@ -307,6 +307,7 @@ pub fn hackrf_device_list() ?HACKRF_DEVICE_LIST {
                             } else {
                                 deviceList.SerialNumbers.append(&[_]u16{}) catch {};
                             }
+                            defer allocator.destroy(@as(*driver.STRING_DESCRIPTOR, @ptrCast(stringDescriptor)));
                         }
                     },
                     else => {},
@@ -450,6 +451,8 @@ pub fn hackrf_open_usb(DesiredSerialNumber: []const u8) ?driver.PDEVICE_DATA {
                                     }
                                 }
                             }
+
+                            defer usbDevices.deinit();
                         }
                     },
                     else => {},
@@ -800,14 +803,12 @@ pub fn hackrf_stop_cmd(Device: *HackrfDevice) HACKRF_STATUS {
 
 pub fn allocate_transfers(Device: *HackrfDevice) HACKRF_STATUS {
     if (Device.UsbTransfers == null) {
-        //var transfersBuffer = std.mem.zeroes([TRANSFER_COUNT * @sizeOf(*driver.Transfer)]u8);
-        //var transfersFBA = std.heap.FixedBufferAllocator.init(&transfersBuffer);
-        //Device.UsbTransfers = @as([*]?*driver.Transfer, @ptrCast(transfersFBA.allocator().create(?*driver.Transfer) catch return HACKRF_STATUS.HACKRF_ERROR_NO_MEM));
         Device.UsbTransfers = @as([*]?*driver.Transfer, @ptrCast(std.heap.page_allocator.alloc(?*driver.Transfer, TRANSFER_COUNT) catch return HACKRF_STATUS.HACKRF_ERROR_NO_MEM));
 
         Device.Buffer = std.mem.zeroes([TRANSFER_COUNT * TRANSFER_BUFFER_SIZE]u8);
 
         for (0..TRANSFER_COUNT) |transferIndex| {
+            // TODO device Metho to create a transfer!
             Device.UsbTransfers.?[transferIndex] = std.heap.page_allocator.create(driver.Transfer) catch return HACKRF_STATUS.HACKRF_ERROR_NO_MEM;
             driver.SetupBulkTransfer(Device.UsbTransfers.?[transferIndex].?, Device.UsbDevice, 0, &Device.Buffer[transferIndex * TRANSFER_BUFFER_SIZE], TRANSFER_BUFFER_SIZE, null, Device, 0);
         }
@@ -932,7 +933,6 @@ pub fn free_transfers(Device: *HackrfDevice) HACKRF_STATUS {
             Device.UsbTransfers.?[transferIndex] = null;
         }
 
-        // TODO: Memory Deallocation, will have to change paradigmn of the structs
         Device.UsbTransfers = null;
     }
 
