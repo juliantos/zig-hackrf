@@ -26,7 +26,8 @@ const _DEVICE_DATA = struct {
     WinusbHandle: usb.WINUSB_INTERFACE_HANDLE,
     Handle: ?*anyopaque,
     DevicePath: std.ArrayList(win.WCHAR),
-    Pipes: std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX),
+    InPipes: std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX),
+    OutPipes: std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX),
 };
 pub const DEVICE_DATA = _DEVICE_DATA;
 pub const PDEVICE_DATA = *_DEVICE_DATA;
@@ -69,12 +70,85 @@ pub const PSTRING_DESCRIPTOR = usb.PUSB_STRING_DESCRIPTOR;
 pub const GUID_DEVINTERFACE_HACKRF: setup.GUID = .{ .Data1 = 0xa5dcbf10, .Data2 = 0x6530, .Data3 = 0x11d2, .Data4 = .{ 0x90, 0x1f, 0x00, 0xc0, 0x4f, 0xb9, 0x51, 0xed } };
 pub const INVALID_HANDLE_VALUE = win.INVALID_HANDLE_VALUE;
 
+pub const ENDPOINT_IN = 0x80;
+pub const ENDPOINT_OUT = 0x00;
+pub const REQUEST_TYPE_VENDOR = 0x2 << 5;
+pub const RECIPIENT_DEVICE = 0x00;
+
+pub const USB_TRANSFER_TYPE = enum(u3) {
+    CONTROL = 0,
+    ISOCHRONOUS = 1,
+    BULK = 2,
+    INTERRUPT = 3,
+    BULK_STREAM = 4,
+};
+
+pub const USB_TRANSFER_STATUS = enum(u3) {
+    COMPLETED = 0,
+    ERROR = 1,
+    TIMED_OUT = 2,
+    CANCELLED = 3,
+    STALL = 4,
+    NO_DEVICE = 5,
+    OVERFLOW = 6,
+};
+
+pub const usb_transfer_cb_fn = fn (*Transfer) void;
+
+pub const IsoPacketDescriptor = struct {
+    Length: u64,
+    ActualLength: u64,
+    Status: USB_TRANSFER_STATUS,
+};
+
+pub const Transfer = struct {
+    DeviceHandle: PDEVICE_DATA,
+    Flags: u8,
+    Endpoint: u8,
+    Type: USB_TRANSFER_TYPE,
+    Timeout: u64,
+    Status: USB_TRANSFER_STATUS,
+    Length: u32,
+    ActualLength: u32,
+    Callback: ?*const usb_transfer_cb_fn,
+    UserData: ?*anyopaque,
+    Buffer: [*]u8,
+    NumIsoPackets: u32,
+    IsoPacketDesc: [0]IsoPacketDescriptor,
+};
+
+const ActiveTransfer = struct {
+    TransferPtr: *Transfer,
+    Overlapped: *usb.OVERLAPPED,
+};
+var ActiveTransfers: std.ArrayList(ActiveTransfer) = std.ArrayList(ActiveTransfer).init(std.heap.page_allocator);
+var TransferMutex: std.Thread.Mutex = .{};
+
 pub fn Init() ?*anyopaque {
     return setup.SetupDiGetClassDevsW(&GUID_DEVINTERFACE_HACKRF, null, null, setup.DIGCF_PRESENT | setup.DIGCF_DEVICEINTERFACE);
 }
 
 pub fn Exit(Context: ?*anyopaque) void {
     _ = setup.SetupDiDestroyDeviceInfoList(Context);
+}
+
+pub fn OpenDevice(Context: ?*anyopaque, UsbVid: u16, UsbPid: u16) ?PDEVICE_DATA {
+    var devices = std.ArrayList(DEVICE_DATA).init(std.heap.page_allocator);
+    GetDevices(Context, &devices);
+
+    for (devices.items, 0..) |usbDevice, i| {
+        var deviceDescriptor: DEVICE_DESCRIPTOR = undefined;
+        if (GetDeviceDescriptor(usbDevice, &deviceDescriptor)) {
+            if (deviceDescriptor.IdVendor == UsbVid and deviceDescriptor.IdProduct == UsbPid) {
+                const newDevice: PDEVICE_DATA = std.heap.page_allocator.create(DEVICE_DATA) catch return null;
+                newDevice.* = devices.swapRemove(i);
+                defer devices.deinit();
+                return newDevice;
+            }
+        }
+    }
+
+    return null;
 }
 
 pub fn GetDevices(Context: ?*anyopaque, Devices: *std.ArrayList(DEVICE_DATA)) void {
@@ -134,11 +208,92 @@ pub fn GetDevices(Context: ?*anyopaque, Devices: *std.ArrayList(DEVICE_DATA)) vo
             }
 
             deviceData.HandlesOpen = true;
-            deviceData.Pipes = std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX).init(std.heap.page_allocator);
+            deviceData.InPipes = std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX).init(std.heap.page_allocator);
+            deviceData.OutPipes = std.ArrayList(usb.WINUSB_PIPE_INFORMATION_EX).init(std.heap.page_allocator);
 
             Devices.append(deviceData) catch {};
         }
     }
+}
+
+pub fn HandleEventsTimeout(Context: ?*anyopaque, Timeout: u64, Completed: ?*bool) !void {
+    _ = Context;
+    _ = Completed;
+    //_ = Timeout;
+
+    var handles = std.ArrayList(?*anyopaque).initCapacity(std.heap.page_allocator, ActiveTransfers.items.len) catch return error.OutOfMemory;
+    defer handles.deinit();
+
+    TransferMutex.lock();
+    for (ActiveTransfers.items) |activeTransfer| {
+        handles.append(activeTransfer.Overlapped.hEvent) catch {
+            TransferMutex.unlock();
+            return error.OutOfMemory;
+        };
+    }
+    TransferMutex.unlock();
+
+    const millis = Timeout / std.time.ns_per_ms;
+    if (handles.items.len > 0) {
+        const val = usb.WaitForMultipleObjectsEx(@intCast(handles.items.len), @ptrCast(handles.items), win.FALSE, @intCast(millis), win.TRUE);
+        switch (val) {
+            usb.WAIT_OBJECT_0...(usb.WAIT_OBJECT_0 + usb.MAXIMUM_WAIT_OBJECTS) => {
+                const index = val - usb.WAIT_OBJECT_0;
+
+                TransferMutex.lock();
+                const activeTransfer = ActiveTransfers.swapRemove(index);
+                TransferMutex.unlock();
+                var bytes: win.DWORD = undefined;
+                const result = usb.WinUsb_GetOverlappedResult(activeTransfer.TransferPtr.DeviceHandle.WinusbHandle, activeTransfer.Overlapped, &bytes, win.FALSE);
+                if (result != 0) {
+                    activeTransfer.TransferPtr.ActualLength = bytes;
+                    activeTransfer.TransferPtr.Status = USB_TRANSFER_STATUS.COMPLETED;
+                } else {
+                    activeTransfer.TransferPtr.Status = USB_TRANSFER_STATUS.ERROR;
+                }
+
+                if (activeTransfer.TransferPtr.Callback != null)
+                    activeTransfer.TransferPtr.Callback.?(activeTransfer.TransferPtr);
+            },
+            usb.WAIT_ABANDONED_0...(usb.WAIT_ABANDONED_0 + usb.MAXIMUM_WAIT_OBJECTS) => {
+                const index = val - usb.WAIT_ABANDONED_0;
+                TransferMutex.lock();
+                _ = ActiveTransfers.swapRemove(index);
+                TransferMutex.unlock();
+            },
+            usb.WAIT_TIMEOUT => {
+                return error.WaitTimeOut;
+            },
+            else => return error.WaitFailed,
+        }
+    } else {
+        std.time.sleep(Timeout);
+    }
+}
+
+pub fn InterruptEventHandler(Context: ?*anyopaque) win.HRESULT {
+    _ = Context;
+
+    TransferMutex.lock();
+    for (ActiveTransfers.items) |activeTransfer| {
+        _ = usb.CloseHandle(activeTransfer.Overlapped.hEvent);
+        var bytes: win.DWORD = undefined;
+        const result = usb.WinUsb_GetOverlappedResult(activeTransfer.TransferPtr.DeviceHandle.WinusbHandle, activeTransfer.Overlapped, &bytes, win.FALSE);
+        if (result != 0) {
+            activeTransfer.TransferPtr.ActualLength = bytes;
+            activeTransfer.TransferPtr.Status = USB_TRANSFER_STATUS.COMPLETED;
+        } else {
+            activeTransfer.TransferPtr.Status = USB_TRANSFER_STATUS.ERROR;
+        }
+
+        if (activeTransfer.TransferPtr.Callback != null)
+            activeTransfer.TransferPtr.Callback.?(activeTransfer.TransferPtr);
+    }
+    ActiveTransfers.clearAndFree();
+
+    TransferMutex.unlock();
+
+    return win.S_OK;
 }
 
 pub fn ClaimInterface(DeviceData: PDEVICE_DATA, InterfaceIndex: usize) win.HRESULT {
@@ -163,7 +318,11 @@ pub fn ClaimInterface(DeviceData: PDEVICE_DATA, InterfaceIndex: usize) win.HRESU
             return hr;
         }
 
-        DeviceData.Pipes.append(pipe) catch {};
+        if (pipe.PipeId & 0x80 > 0) {
+            DeviceData.OutPipes.append(pipe) catch {};
+        } else {
+            DeviceData.InPipes.append(pipe) catch {};
+        }
     }
 
     return hr;
@@ -171,7 +330,8 @@ pub fn ClaimInterface(DeviceData: PDEVICE_DATA, InterfaceIndex: usize) win.HRESU
 
 pub fn ReleaseInterface(DeviceData: PDEVICE_DATA, InterfaceIndex: usize) win.HRESULT {
     _ = InterfaceIndex;
-    DeviceData.Pipes.clearAndFree();
+    DeviceData.OutPipes.clearAndFree();
+    DeviceData.InPipes.clearAndFree();
     return win.S_OK;
 }
 
@@ -185,12 +345,13 @@ pub fn CloseDevice(DeviceData: PDEVICE_DATA) void {
     DeviceData.HandlesOpen = false;
     DeviceData.WinusbHandle = null;
     DeviceData.Handle = null;
-    DeviceData.Pipes.deinit();
+    DeviceData.InPipes.deinit();
+    DeviceData.OutPipes.deinit();
 
     return;
 }
 
-pub fn ControlTransfer(DeviceData: PDEVICE_DATA, RequestType: u8, Request: u8, Value: u8, Index: u16, Data: *u8, Length: u16, Timeout: usize) win.LONG {
+pub fn ControlTransfer(DeviceData: PDEVICE_DATA, RequestType: u8, Request: u8, Value: u16, Index: u16, Data: *u8, Length: u16, Timeout: usize) win.LONG {
     _ = Timeout;
 
     var bResult: win.BOOL = undefined;
@@ -202,8 +363,11 @@ pub fn ControlTransfer(DeviceData: PDEVICE_DATA, RequestType: u8, Request: u8, V
     };
     var lengthTransferred: win.ULONG = undefined;
 
+    std.debug.print("RT 0x{b:0>8}, R 0x{x:0>2}, V {d:>5}, I {d:>5}, D {x:0>2}, L {d:>5}\n", .{ RequestType, Request, Value, Index, Data.*, Length });
+
     bResult = usb.WinUsb_ControlTransfer(DeviceData.WinusbHandle, setupPacket, Data, Length, &lengthTransferred, null);
     if (bResult != win.TRUE) {
+        std.log.err("WinUsb CT error ({})\n", .{@intFromEnum(win.kernel32.GetLastError())});
         return -1;
     }
 
@@ -258,49 +422,71 @@ pub fn SetConfigurationDescriptor(DeviceData: DEVICE_DATA, ConfigurationDescript
     return true;
 }
 
-pub fn GetHackRFSpeed(hDeviceHandle: usb.WINUSB_INTERFACE_HANDLE, pDeviceSpeed: ?*win.UCHAR) bool {
-    if (pDeviceSpeed == null or hDeviceHandle == win.INVALID_HANDLE_VALUE)
-        return false;
+pub fn SetupBulkTransfer(TransferPtr: *Transfer, UsbDevice: PDEVICE_DATA, Endpoint: u8, Buffer: *u8, BufferLen: u32, Callback: ?*const usb_transfer_cb_fn, UserData: ?*anyopaque, Timeout: usize) void {
+    TransferPtr.DeviceHandle = UsbDevice;
+    TransferPtr.Flags = 0;
+    TransferPtr.Endpoint = Endpoint;
+    TransferPtr.Type = USB_TRANSFER_TYPE.BULK;
+    TransferPtr.Timeout = Timeout;
+    TransferPtr.Status = USB_TRANSFER_STATUS.COMPLETED;
+    TransferPtr.Length = BufferLen;
+    TransferPtr.ActualLength = 0;
+    TransferPtr.Callback = Callback;
+    TransferPtr.UserData = UserData;
+    TransferPtr.Buffer = @ptrCast(Buffer);
+    TransferPtr.NumIsoPackets = 0;
 
-    var bResult: win.BOOL = win.TRUE;
-    var length: win.ULONG = @sizeOf(win.UCHAR);
-
-    bResult = usb.WinUsb_QueryDeviceInformation(hDeviceHandle, usb.DEVICE_SPEED, &length, pDeviceSpeed);
-
-    return bResult != 0;
+    return;
 }
 
-//pub fn OpenDeviceData(DeviceData: PDEVICE_DATA, FailureDeviceNotFound: *bool) win.HRESULT {
-//var hr: win.HRESULT = win.S_OK;
-//var bResult: win.BOOL = undefined;
+pub fn SubmitTransfer(TransferPtr: *Transfer) bool {
+    var activeTransfer: ActiveTransfer = undefined;
+    activeTransfer.Overlapped = std.heap.page_allocator.create(usb.OVERLAPPED) catch return false;
+    activeTransfer.Overlapped.hEvent = usb.CreateEventA(null, win.TRUE, win.TRUE, null);
+    activeTransfer.Overlapped.unnamed_0.unnamed_0.Offset = 0;
+    activeTransfer.Overlapped.unnamed_0.unnamed_0.OffsetHigh = 0;
+    activeTransfer.TransferPtr = TransferPtr;
 
-//if (FailureDeviceNotFound != undefined)
-//FailureDeviceNotFound.* = false;
+    var iReturn: win.BOOL = win.FALSE;
+    if (TransferPtr.Endpoint & ENDPOINT_IN > 0) {
+        iReturn = usb.WinUsb_ReadPipe(TransferPtr.DeviceHandle.WinusbHandle, TransferPtr.Endpoint, TransferPtr.Buffer, TransferPtr.Length, &TransferPtr.ActualLength, activeTransfer.Overlapped);
+    } else {
+        iReturn = usb.WinUsb_WritePipe(TransferPtr.DeviceHandle.WinusbHandle, TransferPtr.Endpoint, TransferPtr.Buffer, TransferPtr.Length, &TransferPtr.ActualLength, activeTransfer.Overlapped);
+    }
 
-//const address = std.unicode.utf8ToUtf16LeStringLiteral("\\\\?\\USB#VID_1D50&PID_6089#000000000000000057b068dc241b3e63#{a5dcbf10-6530-11d2-901f-00c04fb951ed}");
-//DeviceData.DevicePath.appendSlice(address) catch {};
+    TransferMutex.lock();
+    ActiveTransfers.append(activeTransfer) catch {
+        TransferMutex.unlock();
+        return false;
+    };
+    TransferMutex.unlock();
+    return iReturn == win.FALSE and GetLastError() == usb.ERROR_IO_PENDING;
+}
 
-//std.debug.print("Address {u}\n", .{address});
+pub fn Abort(TransferPtr: *Transfer) bool {
+    for (TransferPtr.DeviceHandle.OutPipes.items) |pipe| {
+        if (pipe.PipeId == TransferPtr.Endpoint) {
+            const abort = usb.WinUsb_AbortPipe(TransferPtr.DeviceHandle, pipe.PipeId);
+            const flush = usb.WinUsb_FlushPipe(TransferPtr.DeviceHandle, pipe.PipeId);
 
-//if (hr < 0) {
-//return hr;
-//}
+            TransferMutex.lock();
+            for (ActiveTransfers.items) |activeTransfer| {
+                if (TransferPtr.Endpoint == activeTransfer.TransferPtr.Endpoint) {
+                    _ = usb.SetEvent(activeTransfer.Overlapped.hEvent);
+                }
+            }
+            TransferMutex.unlock();
+            return abort == win.TRUE and flush == win.TRUE;
+        }
+    }
+    return false;
+}
 
-//DeviceData.Handle = win.kernel32.CreateFileW(address, win.GENERIC_READ | win.GENERIC_WRITE, win.FILE_SHARE_READ | win.FILE_SHARE_WRITE, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL | win.FILE_FLAG_OVERLAPPED, null);
+pub fn FreeTransfer(TransferPtr: ?*Transfer) bool {
+    if (TransferPtr != null) {
+        TransferPtr.?.Callback = null;
+        TransferPtr.?.UserData = null;
+    }
 
-//if (DeviceData.Handle == win.INVALID_HANDLE_VALUE) {
-//hr = HRESULT_FROM_WIN32(win.kernel32.GetLastError());
-//return hr;
-//}
-
-//bResult = usb.WinUsb_Initialize(DeviceData.Handle, &DeviceData.WinusbHandle);
-
-//if (bResult == win.FALSE) {
-//hr = HRESULT_FROM_WIN32(win.kernel32.GetLastError());
-//win.CloseHandle(DeviceData.Handle.?);
-//return hr;
-//}
-
-//DeviceData.HandlesOpen = true;
-//return hr;
-//}
+    return true;
+}

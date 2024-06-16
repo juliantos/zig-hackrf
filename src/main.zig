@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const hackrf = @import("hackrf.zig");
 
 pub fn main() !void {
     //var deviceData: root.DEVICE_DATA = undefined;
@@ -9,6 +10,10 @@ pub fn main() !void {
     const context = root.Init();
 
     std.debug.print("Context: {any}\n", .{context});
+
+    const devicePtr: ?root.PDEVICE_DATA = root.OpenDevice(context, hackrf.HACKRF_USB_VID, hackrf.HACKRF_ONE_USB_PID);
+
+    std.debug.print("Data Device {?any}\n", .{devicePtr});
 
     //hResult = root.OpenDevice(&deviceData, &noDevice);
 

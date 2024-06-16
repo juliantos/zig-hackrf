@@ -62,12 +62,40 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(hackrf_info);
 
+    const getopt = b.dependency("getopt", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const hackrf_sweep = b.addExecutable(.{
+        .name = "zig-hackrf-sweep",
+        .root_source_file = b.path("src/hackrf_sweep.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    hackrf_sweep.root_module.addImport("getopt", getopt.module("getopt"));
+    hackrf_sweep.addIncludePath(b.path("fftw/include"));
+
+    hackrf_sweep.linkLibC();
+    hackrf_sweep.linkSystemLibrary("WinUsb");
+    hackrf_sweep.linkSystemLibrary("SetupApi");
+
+    hackrf_sweep.addLibraryPath(b.path("fftw/lib"));
+    hackrf_sweep.linkSystemLibrary("libfftw3f-3");
+    hackrf_sweep.linkSystemLibrary("libfftw3-3");
+    hackrf_sweep.addRPath(b.path("fftw/lib"));
+
+    b.installArtifact(hackrf_sweep);
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
     const run_cmd = b.addRunArtifact(exe);
 
     const info_cmd = b.addRunArtifact(hackrf_info);
+
+    const sweep_cmd = b.addRunArtifact(hackrf_sweep);
 
     // By making the run step depend on the install step, it will be run from the
     // installation directory rather than directly from within the cache directory.
@@ -89,6 +117,9 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const info_step = b.step("info", "Run hackrf-info");
+    const info_step = b.step("info", "Run zig-hackrf-info");
     info_step.dependOn(&info_cmd.step);
+
+    const sweep_step = b.step("sweep", "Run zig-hackrf-sweep");
+    sweep_step.dependOn(&sweep_cmd.step);
 }
